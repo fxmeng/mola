@@ -12,10 +12,13 @@ from torch import nn
 @dataclass
 class ModelArgs:
     # default hyperparameters for the Llama 7B model
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
-    n_kv_heads: Optional[int] = None
+    dim: int = 2048
+    n_layers: int = 30
+    n_experts: int = 8
+    aux_loss_alpha: float = 0.001
+    n_heads: int = 16
+    rope_dim: int = 64
+    kv_lora_rank: int = 128
     vocab_size: int = 32000
     hidden_dim: Optional[int] = None
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
@@ -38,6 +41,71 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
+class AddAuxiliaryLoss(torch.autograd.Function):
+    """
+    The trick function of adding auxiliary (aux) loss,
+    which includes the gradient of the aux loss during backpropagation.
+    """
+
+    @staticmethod
+    def forward(ctx, x, loss):
+        assert loss.numel() == 1
+        ctx.dtype = loss.dtype
+        ctx.required_aux_loss = loss.requires_grad
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_loss = None
+        if ctx.required_aux_loss:
+            grad_loss = torch.ones(1, dtype=ctx.dtype, device=grad_output.device)
+        return grad_output, grad_loss
+
+class MoLE(nn.Module):
+    def __init__(self, hidden_size, kv_lora_rank, n_experts, aux_loss_alpha):
+        super().__init__()
+        self.n_experts = n_experts
+        self.kv_lora_rank = kv_lora_rank
+        self.alpha = aux_loss_alpha
+        self.experts = nn.ModuleList([nn.Linear(hidden_size, kv_lora_rank, bias=False) for _ in range(self.n_experts)])
+        self.gate = nn.Linear(hidden_size, n_experts, bias=False)
+
+    def select_latent_expert(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        ### compute gating score
+        hidden_states = hidden_states.view(-1, h)
+        #logits = F.linear(hidden_states.type(torch.float32), self.gate.weight.type(torch.float32), None)
+        #scores = logits.softmax(dim=-1, dtype=torch.float32)
+        logits = self.gate(hidden_states)
+        scores = logits.softmax(dim=-1)
+        ### select top-1 experts
+        argmax = torch.argmax(scores, dim=-1)
+        ### expert-level computation auxiliary loss
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            # always compute aux loss based on the naive greedy topk method
+            topk_idx_for_aux_loss = argmax.view(bsz, -1)
+            scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+            ce = torch.zeros(bsz, self.n_experts, device=hidden_states.device)
+            ce.scatter_add_(1,topk_idx_for_aux_loss,torch.ones(bsz, seq_len, device=hidden_states.device),).div_(seq_len / self.n_experts)
+            aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+        else:
+            aux_loss = None
+        return argmax, aux_loss
+    
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        argmax, aux_loss = self.select_latent_expert(hidden_states)
+        hidden_states = hidden_states.view(-1, h)
+        y = torch.empty(bsz * seq_len, self.kv_lora_rank, device=hidden_states.device)
+        for i, expert in enumerate(self.experts):
+            out = expert(hidden_states[argmax == i])
+            y[argmax == i] = expert(hidden_states[argmax == i])
+        y = y.view(bsz, seq_len, self.kv_lora_rank)
+        if self.training:
+            y = AddAuxiliaryLoss.apply(y, aux_loss)
+        return y
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -49,8 +117,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    assert freqs_cis.shape == (x.shape[2], x.shape[-1])
+    shape = [d if i == 2 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(shape)
 
 def apply_rotary_emb(
@@ -80,42 +148,27 @@ def apply_rotary_emb(
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        assert args.n_heads % self.n_kv_heads == 0
-        model_parallel_size = 1
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_heads = args.n_heads
+        self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.rope_dim = args.rope_dim
+        self.kv_lora_rank = args.kv_lora_rank
+        self.q_proj = nn.Linear(args.dim, args.dim, bias=False)
+        self.q_rope = nn.Linear(args.dim, self.n_heads * args.rope_dim, bias=False)
+        self.kv_latent_proj = MoLE(args.dim, args.kv_lora_rank, args.n_experts, args.aux_loss_alpha)
+        self.k_rope = nn.Linear(args.dim, args.rope_dim, bias=False)
+        self.kv_latent_layernorm = RMSNorm(args.kv_lora_rank, args.norm_eps)
+        self.k_up_proj = nn.Linear(args.kv_lora_rank, args.dim, bias=False)
+        self.v_up_proj = nn.Linear(args.kv_lora_rank, args.dim, bias=False)
+        self.wo = nn.Linear(args.dim, args.dim, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
-        self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
-
-        # use flash attention or a manual implementation?
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            self.register_buffer("mask", mask)
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
 
     def forward(
         self,
@@ -124,45 +177,35 @@ class Attention(nn.Module):
         freqs_sin: torch.Tensor,
     ):
         bsz, seqlen, _ = x.shape
-
         # QKV
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        # RoPE relative positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
-
-        # grouped multiquery attention: expand out keys and values
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
-
-        # flash implementation
-        if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
-        else:
-            # manual implementation
-            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
-            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
-
+        xq, compressed_kv  = self.q_proj(x), self.kv_latent_layernorm(self.kv_latent_proj(x))
+        xk, xv = self.k_up_proj(compressed_kv), self.v_up_proj(compressed_kv)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # RoPE
+        xq_rope, xk_rope = self.q_rope(x), self.k_rope(x)
+        xq_rope = xq_rope.view(bsz, seqlen, self.n_heads, self.rope_dim).transpose(1, 2)
+        xk_rope = xk_rope.view(bsz, seqlen, 1, self.rope_dim).transpose(1, 2)
+        xq_rope, xk_rope = apply_rotary_emb(xq_rope, xk_rope, freqs_cos, freqs_sin)
+        
+        # Attention
+        attn_weights = torch.matmul(xq, xk.transpose(2, 3))
+        attn_rope = torch.matmul(xq_rope, xk_rope.transpose(2, 3))
+        scores = (attn_weights+attn_rope)  / math.sqrt(self.head_dim+self.rope_dim)
+        assert hasattr(self, 'mask')
+        scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = self.attn_dropout(scores)
+        
+        # Output
+        output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-
         # final projection into the residual stream
         output = self.wo(output)
-        output = self.resid_dropout(output)
         return output
-
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
